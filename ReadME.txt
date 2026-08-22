@@ -3,9 +3,9 @@ Codes and Data for: Preservation and storage effects on river sediment microbiom
 Raw sequence data are available at the NCBI Sequence Read Archive (SRA) under BioProject accession PRJNA1336108. The corresponding visualization data, processed amplicon datasets, metadata, and R codes used to generate the analyses and figures presented in the manuscript are deposited in this repository.
 
 ## Source Data
-MS-Preservation-Methods_R-Codes.R                           # Main R script containing the workflow for microbial diversity, community composition, community stability, taxonomic response, and community assembly analyses, together with figure generation.
-MS-Preservation-Methods_Supplementary-Tables.xlsx       # Sample metadata, sequencing summaries, statistical outputs, ASV tables, and supplementary datasets used throughout the study.
-MS-Preservation-Methods_Supplementary-Information.docx  # Additional methodological descriptions and supplementary information.
+MS-Preservation-Methods_R-Codes.R                          # Main R script containing the workflow for microbial diversity, community composition, community stability, taxonomic response, and community assembly analyses, together with figure generation.
+MS-Preservation-Methods_Supplementary-Tables.xlsx          # Sample metadata, sequencing summaries, statistical outputs, ASV tables, and supplementary datasets used throughout the study.
+MS-Preservation-Methods_Supplementary-Information.docx     # Additional methodological descriptions and supplementary information.
 src/
     bac.asv-table.tsv                                      # Processed bacterial (16S rRNA gene) ASV abundance table.
     euk.asv-table.tsv                                      # Processed eukaryotic (18S rRNA gene) ASV abundance table.
