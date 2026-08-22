@@ -1,0 +1,1235 @@
+---
+Title: "Preservation and storage effects on river sediment microbiomes"
+Author: "Joeselle Serrana"
+Date: "03/27/2025"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## STEP 00: Load required library and set working directory 
+
+```{r}
+library("dada2"); packageVersion("dada2") ## For processing amplicon sequence data.
+library("phyloseq"); library("microeco") ## For data manipulation, analysis and visualization. Visit https://github.com/ChiLiubio/microeco for more details.
+library("ggplot2"); library("magrittr")
+
+setwd("../MS-Preservation-Methods_Analysis")
+
+bac.mco <- readRDS("src/bac.mco.RDS") ## [START FROM STEP 4...] Read microtable object. 
+euk.mco <- readRDS("src/euk.mco.RDS") ## [START FROM STEP 4...] Read microtable object.
+
+col.time <- c("18 hr" = "#1B9E77", "#E6AB02" = "2 wks", "#D95F02" = "4 wks", "#A6761D" = "6 wks", "#666666" = "8 wks")
+col.method <- c("Ethanol at RT" = "#1B9E77", "In dry ice then to −80°C" = "#6A3D9A", "NAP buffer at RT" = "#66A61E", 
+                "No preservative at −20°C" = "#56B4E9", "No preservative at −80°C" = "#0072B2", "No preservative at RT" = "#E69F00")
+```
+
+## ########################################################## ##
+##                                                            ##
+##           AMPLICON ANALYSIS - START FROM HERE!             ##
+##                                                            ##
+## ########################################################## ##
+## Amplicon sequence processing w/ DADA2
+
+```{r, eval = FALSE}
+## STEP 0: Copy raw reads to ./data directory.
+
+## STEP 1a: Read quality assessment: Plot read quality
+
+## Sort the file names to ensure that the names for the corresponding forward/reverse reads are in same order and store them in two variables.
+fnFs <- sort(list.files("data/raw-reads/Eukaryote", pattern = "_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files("data/raw-reads/Eukaryote", pattern = "_2.fastq.gz", full.names = TRUE))
+
+## Extract sample names from the filenames, assuming filenames have the format: SAMPLENAME_XXX.fastq.qz
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+## Plot average quality scores for forward/reverse reads. The script below will plot samples 1 to 8 only. Change the number to include more files.
+#plotQualityProfile(fnFs[1:9]); plotQualityProfile(fnRs[1:9])
+
+## STEP 1b: Quality filtering: Filter reads based on length and maxee
+
+## Place filtered files in the "filtered-reads/" subdirectory.
+filtFs <- file.path("data/filtered-reads/Eukaryote", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path("data/filtered-reads/Eukaryote", paste0(sample.names, "_R_filt.fastq.gz"))
+
+## No need for "trimLeft" since adapter and primer barcodes have been truncated from the raw reads.
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                     maxN = 0,
+                     maxEE = c(2,2), 
+                     truncQ = 2,
+                     truncLen = c(220, 200), #minLen = 100,
+                     rm.phix = TRUE,
+                     compress = TRUE, 
+                     multithread = TRUE)  ## On Windows set multithread = FALSE
+
+head(out)
+
+## STEP 1c: Quality filtering: Learn error rates
+set.seed(100)
+
+## Estimate the error model for DADA2 algorithm using forward/reverse reads.
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+## Plot the error rates for all possible base transitions.
+plotErrors(errF, nominalQ = TRUE)
+
+## STEP 1d: Dereplicate and denoise reads
+
+## Dereplicate FASTQ files for both forward and reverse reads to speed up computation.
+exists <- file.exists(filtFs)
+
+derepFs <- derepFastq(filtFs[exists], verbose = TRUE)
+derepRs <- derepFastq(filtRs[exists], verbose = TRUE)
+
+## Name the derep-class objects by the sample names.
+names(derepFs) <- sample.names[exists]
+names(derepRs) <- sample.names[exists]
+
+## At this step, the core sample inference algorithm is applied to the dereplicated data.
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+dadaFs[[1]] # Inspect the returned dada-class object.
+
+## STEP 1e: Merge paired-end reads and construct sequence table
+
+## Merge denoised reads.
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+head(mergers[[1]]) # Inspect the merger data.frame from the first sample.
+
+## Organize sequence variants into a sequence table.
+seqtab <- makeSequenceTable(mergers)
+
+dim(seqtab) # The sequences being tabled vary in length.
+table(nchar(getSequences(seqtab))) # Inspect distribution of sequence lengths.
+
+## STEP 1f: Chimera filtering
+## Perform de novo chimera sequence detection and removal.
+seqtab.nochim <- removeBimeraDenovo(seqtab, 
+                                    method = "consensus", 
+                                    multithread = TRUE,
+                                    verbose = TRUE) # Remove chimera.
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+## STEP 1g: Singleton filtering
+## Remove all ASVs present only once (or less) across all samples:
+
+is1 <- colSums(seqtab.nochim) <= 1
+seqtab.nosing <- seqtab.nochim[,!is1]
+
+## Extract read processing information (counts)
+
+getN <- function(x) sum(getUniques(x)) # Track reads through the pipeline.
+track <- cbind(out, 
+               sapply(dadaFs, getN), 
+               sapply(dadaRs, getN), 
+               sapply(mergers, getN),
+               rowSums(seqtab.nochim),
+               rowSums(seqtab.nosing))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim", "nosing")
+rownames(track) <- sample.names; head(track)
+
+## Extract ASV-Table with sequence and abundance/sample information
+## Save non-chimeric ASV table.
+
+saveRDS(seqtab.nochim, "src/dada2/euk.seqtab.nochim.RDS")
+saveRDS(seqtab.nosing, "src/dada2/euk.seqtab.nosing.RDS")
+
+write.table(track, "src/dada2/euk.read.counts.tsv") ## Read counts per processing step.
+write.table(t(seqtab.nosing), "src/dada2/euk.asv.table.tsv") ## Transposed seqtab.nosim file.
+```
+
+## Taxonomic assignment, and phylognetic analysis
+ 
+```{r, eval = FALSE}
+## STEP 2a: Assign taxonomic with the GTDB database for 16S rRNA
+
+set.seed(100) # Initialize random number generator for reproducibility
+seqtab.nosing <- readRDS("src/dada2/bac.seqtab.nosing.RDS") # Read saved RDS file if run not saved.
+
+## Assign taxonomy using GTDB (DADA2 formatted 16S rRNA gene sequences for both bacteria & archaea) from https://zenodo.org/records/4735821 (previously downloaded in the data/database/ directory).
+taxa <- assignTaxonomy(seqtab.nosing, "data/database/silva_nr99_v138.2_toSpecies_trainset.fa.gz", multithread = TRUE)
+#colnames(taxa) <- c("Kingdom", "Phylum","Class", "Order", "Family", "Genus", "Species"); unname(taxa)
+
+## Save taxonomic assignment.
+saveRDS(taxa, "src/dada2/bac.taxa.RDS")
+
+## STEP 2c: Phylogenetic analysis
+
+library("DECIPHER")
+library("phangorn")
+library("Biostrings")
+
+set.seed(100) # Initialize random number generator for reproducibility
+seqtab.nosing <- readRDS("src/dada2/bac.seqtab.nosing.RDS") # Read saved RDS file if run not saved.
+
+## Run sequence alignment (MSA) using DECIPHER.
+sequences <- getSequences(seqtab.nosing)
+names(sequences) <- sequences ## Extract sequences from DADA2 output
+
+alignment <- AlignSeqs(DNAStringSet(sequences), anchor = NA)
+
+saveRDS(sequences, "src/dada2/bac.sequences.RDS") ## Save alignment.
+saveRDS(alignment, "src/dada2/bac.alignment.RDS") ## Save alignment.
+
+writeXStringSet(DNAStringSet(sequences), file = "src/dada2/bac.sequences.fasta") ## Save the alignment as FASTA file
+writeXStringSet(alignment, file = "src/dada2/bac.alignment.fasta") ## Save the alignment as FASTA file
+
+## STEP 2c: FastTree v2.1.11 (https://microbesonline.org/fasttree/)
+#$ module load fasttree/2.1.11
+#$ FastTree -gtr -nt bac.alignment.fasta > bac.fasttree.tree
+## Save tree file at the "src/fasttree/" subdirectory.
+```
+
+```{r, eval = FALSE}
+## STEP 2a: Assign taxonomy with the PR2 database for 18S rRNA
+
+set.seed(100) # Initialize random number generator for reproducibility
+seqtab.nosing <- readRDS("src/dada2/euk.seqtab.nosing.RDS") # Read saved RDS file if run not saved.
+
+## Assign taxonomy using PR2 database version 4.41.0 (previously downloaded in the data/database/ directory).
+taxa <- assignTaxonomy(seqtab.nosing, "data/database/pr2_version_5.0.0_SSU_dada2.fasta.gz", multithread = TRUE)
+colnames(taxa) <- c("Domain", "Supergroup", "Division", "Subdivision", "Class", "Order", "Family", "Genus", "Species"); unname(taxa)
+
+## Remove taxonomy suffix ":nucl" and ":plas" from PR2 database annotation because we only need the taxa and  not the organelle information.
+taxa <- gsub(":nucl", "", taxa); taxa <- gsub(":plas", "", taxa)
+
+## Save taxonomic assignment.
+saveRDS(taxa, "src/dada2/euk.taxa.RDS")
+
+## STEP 2c: Phylogenetic analysis
+
+library("DECIPHER")
+library("phangorn")
+library("Biostrings")
+
+set.seed(100) # Initialize random number generator for reproducibility
+seqtab.nosing <- readRDS("src/dada2/euk.seqtab.nosing.RDS") # Read saved RDS file if run not saved.
+
+## Run sequence alignment (MSA) using DECIPHER.
+sequences <- getSequences(seqtab.nosing)
+names(sequences) <- sequences ## Extract sequences from DADA2 output
+
+alignment <- AlignSeqs(DNAStringSet(sequences), anchor = NA)
+
+saveRDS(sequences, "src/dada2/euk.sequences.RDS") ## Save alignment.
+saveRDS(alignment, "src/dada2/euk.alignment.RDS") ## Save alignment.
+
+writeXStringSet(DNAStringSet(sequences), file = "src/dada2/euk.sequences.fasta") ## Save the alignment as FASTA file
+writeXStringSet(alignment, file = "src/dada2/euk.alignment.fasta") ## Save the alignment as FASTA file
+
+## STEP 2c: FastTree v2.1.11 (https://microbesonline.org/fasttree/)
+module load fasttree/2.1.11
+FastTree -gtr -nt bac.alignment.fasta > bac.fasttree.tree
+FastTree -gtr -nt euk.alignment.fasta > euk.fasttree.tree
+FastTree -gtr -nt dar.alignment.fasta > dar.fasttree.tree
+## Save tree file at the "src/fasttree/" subdirectory.
+```
+
+## Prepare input data for downstream analyses
+
+```{r 16S rRNA data}
+## Import sample data information, i.e., metadata.txt.
+metadata <- readxl::read_excel("../MS-Preservation-Methods_Supplementary-Tables.xlsx", sheet = "S1 Metadata")
+metadata <- data.frame(metadata, row.names = 1)
+metadata$Method.Time <- paste(metadata$Method, metadata$Time)
+
+## Import as phyloseq object for easier data processing.
+
+## Create phyloseq object: contains OTU table (taxa abundances), sample metadata, taxonomy table (mapping between OTUs and higher-level taxonomic classifications), and phylogenetic tree (relations between the taxa).
+seqtab.nosing <- readRDS("src/dada2/bac.seqtab.nosing.RDS") ## Read otu table if run not saved.
+taxa <- readRDS("src/dada2/bac.taxa.RDS") # Read saved taxonomic annotation file if run not saved.
+tree <- read_tree("src/fasttree/bac.fasttree.tree") ## Import tree file if fasttree was used.
+
+## Create phloseq object.
+psq <- phyloseq(otu_table(seqtab.nosing, taxa_are_rows = FALSE), 
+                    phyloseq::tax_table(as.matrix(taxa)), 
+                    phy_tree(tree), 
+                    sample_data(metadata))
+psq ## phy_tree(tree)) if tree was generated with iqtree.
+
+## ASVs renamed to more convenient shorter form (e.g., ASV100), and actual ASV sequences stored as a DNAStringSet (refseq slot).
+dna <- Biostrings::DNAStringSet(taxa_names(psq))
+names(dna) <- taxa_names(psq)
+psq <- merge_phyloseq(psq, dna)
+taxa_names(psq) <- paste0("ASV", seq(ntaxa(psq)))
+psq
+
+## Root the phylogenetic tree to calculate phylogeny based diversity metrics.
+set.seed(0327)
+phy_tree(psq) <- ape::root(phy_tree(psq), sample(taxa_names(psq), 1), resolve.root = TRUE)
+ape::is.rooted(phy_tree(psq))
+psq
+
+## Data filtering and transformation.
+
+## Remove sample B117 for low ASV count due to sequencing error.
+psq <- prune_samples(sample_names(psq) != "B117", psq) 
+
+# Remove 10-tons!
+psq <- prune_taxa(taxa_sums(psq) > 10, psq) 
+
+## Filter out contaminants with decontam
+library("decontam")
+neg <- c(TRUE, rep(FALSE, 89)) # Identify contaminants based on prevalence in blanks
+contam.prevalence <- isContaminant(psq, method = "prevalence", neg = neg)
+
+## Filter out the identified contaminants
+psq.nocontam <- prune_taxa(!contam.prevalence$contaminant, psq)
+
+## Standardize abundances to the median sequencing depth
+total <- median(sample_sums(psq.nocontam)); standf <- function(x, t = total) round(t * (x / sum(x)))
+psq.median <- transform_sample_counts(psq.nocontam, standf)
+
+## Transform phyloseq object to a microtable for microeco R package analyses.
+
+## Create a microtable object and perform additional filters, i.e., removing OTUs with the taxonomic assignments “mitochondria” or “chloroplast”, and making the ASV and sample information consistent across all files in the dataset object with the function tidy_dataset to trim the dataset.
+mco <- file2meco::phyloseq2meco(psq.median)
+mco$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+mco$tidy_dataset(); print(mco)
+
+# [NOT PERFORMED] Relative abundance threshold is 0.01, and occurrence frequency 0.01, 1% samples should have the target features.
+#mco$filter_taxa(rel_abund = 0.00001); print(mco)
+
+## use R subset function to filter taxa in tax_table.
+mco$tax_table %<>% base::subset(Kingdom == "k__Archaea" | Kingdom == "k__Bacteria");
+mco$tidy_dataset()
+print(mco)
+
+mco$tax_table$Species <- ifelse(mco$tax_table$Species == "s__" & grepl("^g__$", mco$tax_table$Genus), paste0("s__", sub("g__", "", mco$tax_table$Genus)), 
+                         ifelse(mco$tax_table$Species == "s__", paste0("s__", sub("g__", "", mco$tax_table$Genus), " sp."), paste0("s__", sub("g__", "", mco$tax_table$Genus), sub("s__", " ", mco$tax_table$Species))))
+
+## For the taxonomic dataset: Add "unclassified" name to filtered out annotations if higher taxa level is available (e.g. s__Unclassified Ruminococcaceae).
+mco$tax_table %<>% tidy_taxonomy
+tmp <- mco$tax_table; for(i in 1:nrow(tmp)){if(any(grepl("__$", tmp[i, ]))){matchall <- grep("__$", tmp[i, ])
+tmp[i, matchall] <- paste0(tmp[i, matchall], "Unc. ", gsub(".__", "", tmp[i, matchall[1] - 1]))}}
+mco$tax_table <- tmp
+
+mco$tax_table$Species <- ifelse(grepl("^s__Unc. ", mco$tax_table$Species), paste0(mco$tax_table$Species, " sp."), mco$tax_table$Species)
+print(mco)
+
+## Remove Blank sample
+mco$sample_table %<>% base::subset(Method != "Blank sample"); mco$tidy_dataset()
+print(mco)
+
+## STEP 3e: Calculate abundance, alpha and beta diversity estimates.
+mco$cal_abund(); class(mco$taxa_abund) ## Calculate the taxa abundance at each taxonomic rank using cal_abund().
+mco$cal_alphadiv(PD = TRUE); class(mco$alpha_diversity) ## Calculate the Alpha diversity w/ Faith's phylogenetic diversity.
+mco$cal_betadiv(unifrac = TRUE); class(mco$beta_diversity) ## Create trans_beta object and measure parameter - dataset$beta_diversity
+print(mco)
+
+## Extract ASV-Table with sequence, abundance/sample and taxonomic information.
+write.csv(cbind(mco$otu_table, mco$tax_table), "src/bac.asv-table.tsv", quote = FALSE)
+saveRDS(mco, "src/bac.mco.RDS") # Save microtable used for downstream analyses.
+```
+
+```{r 18S rRNA data}
+## Import sample data information, i.e., metadata.txt.
+metadata <- readxl::read_excel("../MS-Preservation-Methods_Supplementary-Tables.xlsx", sheet = "S1 Metadata")
+metadata <- data.frame(metadata, row.names = 1)
+metadata$Method.Time <- paste(metadata$Method, metadata$Time)
+
+## Import as phyloseq object for easier data processing.
+
+## Create phyloseq object: contains OTU table (taxa abundances), sample metadata, taxonomy table (mapping between OTUs and higher-level taxonomic classifications), and phylogenetic tree (relations between the taxa).
+seqtab.nosing <- readRDS("src/dada2/euk.seqtab.nosing.RDS"); rownames(seqtab.nosing) <- gsub("E", "B", rownames(seqtab.nosing))
+taxa <- readRDS("src/dada2/euk.taxa.RDS") # Read saved taxonomic annotation file if run not saved.
+tree <- read_tree("src/fasttree/euk.fasttree.tree") ## Import tree file if fasttree was used.
+
+## Create phloseq object.
+psq <- phyloseq(otu_table(seqtab.nosing, taxa_are_rows = FALSE), 
+                    phyloseq::tax_table(as.matrix(taxa)), 
+                    phy_tree(tree), 
+                    sample_data(metadata))
+psq ## phy_tree(tree)) if tree was generated with iqtree.
+
+## ASVs renamed to more convenient shorter form (e.g., ASV100), and actual ASV sequences stored as a DNAStringSet (refseq slot).
+dna <- Biostrings::DNAStringSet(taxa_names(psq))
+names(dna) <- taxa_names(psq)
+psq <- merge_phyloseq(psq, dna)
+taxa_names(psq) <- paste0("ASV", seq(ntaxa(psq)))
+psq
+
+## Root the phylogenetic tree to calculate phylogeny based diversity metrics.
+set.seed(0327)
+phy_tree(psq) <- ape::root(phy_tree(psq), sample(taxa_names(psq), 1), resolve.root = TRUE)
+ape::is.rooted(phy_tree(psq))
+psq
+
+## Data filtering and transformation.
+
+## Remove sample B117 for low ASV count due to sequencing error.
+#psq <- prune_samples(sample_names(psq) != "B117", psq) 
+
+# Remove 10-tons!
+psq <- prune_taxa(taxa_sums(psq) > 10, psq) 
+
+## Filter out contaminants with decontam
+library("decontam")
+neg <- c(TRUE, rep(FALSE, 89)) # Identify contaminants based on prevalence in blanks
+contam.prevalence <- isContaminant(psq, method = "prevalence", neg = neg)
+
+## Filter out the identified contaminants
+psq.nocontam <- prune_taxa(!contam.prevalence$contaminant, psq)
+
+## Standardize abundances to the median sequencing depth
+total <- median(sample_sums(psq.nocontam)); standf <- function(x, t = total) round(t * (x / sum(x)))
+psq.median <- transform_sample_counts(psq.nocontam, standf)
+
+## Transform phyloseq object to a microtable for microeco R package analyses.
+
+## Create a microtable object and perform additional filters, i.e., removing OTUs with the taxonomic assignments “mitochondria” or “chloroplast”, and making the ASV and sample information consistent across all files in the dataset object with the function tidy_dataset to trim the dataset.
+mco <- file2meco::phyloseq2meco(psq.median)
+mco$filter_pollution(taxa = c("mitochondria", "chloroplast"))
+mco$tidy_dataset(); print(mco)
+
+## Use R subset function to filter taxa in tax_table.
+mco$tax_table %<>% base::subset(Domain == "d__Eukaryota"); mco$tidy_dataset(); print(mco)
+mco$tax_table %<>% base::subset(Class != "c__Embryophyceae"); mco$tidy_dataset(); print(mco)
+
+colnames(mco$tax_table)[4] <- "Subdivision"
+
+#mco$tax_table$Species <- ifelse(mco$tax_table$Species == "s__" & grepl("^g__$", mco$tax_table$Genus), paste0("s__", sub("g__", "", mco$tax_table$Genus)), 
+#                         ifelse(mco$tax_table$Species == "s__", paste0("s__", sub("g__", "", mco$tax_table$Genus), " sp."), paste0("s__", sub("g__", "", mco$tax_table$Genus), sub("s__", " ", mco$tax_table$Species))))
+
+## For the taxonomic dataset: Add "unclassified" name to filtered out annotations if higher taxa level is available (e.g. s__Unclassified Ruminococcaceae).
+mco$tax_table %<>% tidy_taxonomy
+tmp <- mco$tax_table; for(i in 1:nrow(tmp)){if(any(grepl("__$", tmp[i, ]))){matchall <- grep("__$", tmp[i, ])
+tmp[i, matchall] <- paste0(tmp[i, matchall], "Unc. ", gsub(".__", "", tmp[i, matchall[1] - 1]))}}
+mco$tax_table <- tmp
+
+mco$tax_table$Species <- ifelse(grepl("^s__Unc. ", mco$tax_table$Species), paste0(mco$tax_table$Species, " sp."), mco$tax_table$Species)
+print(mco)
+
+## Remove Blank sample
+mco$sample_table %<>% base::subset(Method != "Blank sample"); mco$tidy_dataset()
+print(mco)
+
+## STEP 3e: Calculate abundance, alpha and beta diversity estimates.
+mco$cal_abund(); class(mco$taxa_abund) ## Calculate the taxa abundance at each taxonomic rank using cal_abund().
+mco$cal_alphadiv(PD = TRUE); class(mco$alpha_diversity) ## Calculate the Alpha diversity w/ Faith's phylogenetic diversity.
+mco$cal_betadiv(unifrac = TRUE); class(mco$beta_diversity) ## Create trans_beta object and measure parameter - dataset$beta_diversity
+print(mco)
+
+## Extract ASV-Table with sequence, abundance/sample and taxonomic information.
+write.csv(cbind(mco$otu_table, mco$tax_table), "src/euk.asv-table.tsv", quote = FALSE)
+saveRDS(mco, "src/euk.mco.RDS") # Save microtable used for downstream analyses.
+```
+
+## ########################################################## ##
+##                                                            ##
+##          DOWNSTREAM ANALYSES - START FROM HERE!            ##
+##                                                            ##
+## ########################################################## ##
+
+### Rarefaction curves
+
+```{r rarefaction curves}
+## Rarefaction visualization 
+
+library("MicrobiotaProcess")
+set.seed(0327) # For reproducibly random number
+
+#bac.mco <- readRDS("src/bac.mco.RDS"); psq <- file2meco::meco2phyloseq(bac.mco)
+#rareres <- get_rarecurve(obj = psq, chunks = 1000); saveRDS(rareres, "src/bac.rareres.RDS")
+rareres <- readRDS("src/bac.rareres.RDS")
+
+r1 <- ggrarecurve(obj = rareres, indexNames = c("Observe", "ACE", "Chao1", "Shannon"), shadow = TRUE, 
+                  #factorNames = "Method", 
+                  se = FALSE) + 
+      theme_bw() + #scale_color_manual(values = col.method) + scale_fill_manual(values = col.method) +
+      theme(legend.position = "none") + 
+      guides(fill = guide_legend(ncol = 2))
+
+print(r1)
+
+#euk.mco <- readRDS("src/euk.mco.RDS"); psq <- file2meco::meco2phyloseq(euk.mco)
+#rareres <- get_rarecurve(obj = psq, chunks = 1000); saveRDS(rareres, "src/euk.rareres.RDS")
+rareres <- readRDS("src/euk.rareres.RDS")
+
+r2 <- ggrarecurve(obj = rareres, indexNames = c("Observe", "ACE", "Chao1", "Shannon"), shadow = TRUE, 
+                  #factorNames = "Method", 
+                  se = FALSE) + 
+      theme_bw() + #scale_color_manual(values = col.method) + scale_fill_manual(values = col.method) +
+      theme(legend.position = "none") + 
+      guides(fill = guide_legend(ncol = 2))
+
+print(r2)
+ 
+r1 / r2
+```
+
+### Visualize community composition
+
+```{r}
+library("magrittr"); library("dplyr")
+
+# Top 10 dominant phyla (16S) and divisions (18S)
+list(`16S_Phylum` = trans_abund$new(dataset = bac.mco, taxrank = "Phylum", ntaxa = 10)$data_abund %>% group_by(Taxonomy) %>%
+    summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+    mutate(Percent = round(100 * Abundance / sum(Abundance), 2)) %>%
+    arrange(desc(Percent)),
+    `18S_Division` = trans_abund$new(dataset = euk.mco, taxrank = "Division", ntaxa = 10)$data_abund %>% group_by(Taxonomy) %>% 
+    summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+    mutate(Percent = round(100 * Abundance / sum(Abundance), 2)) %>%
+    arrange(desc(Percent)))
+
+dataset <- clone(bac.mco)
+t1 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", ntaxa = 10, groupmean = "Method")
+g1 <- t1$plot_bar(clustering_plot = TRUE, color_values = paletteer::paletteer_d("ggthemes::Miller_Stone"))
+g1[[1]] <- g1[[1]] + theme_bw() + theme(axis.title.x = element_text(size = 10), axis.ticks.y = element_blank(), axis.line.y = element_blank(), 
+                                        legend.title = element_text(size = 10), legend.text = element_text(size = 8), legend.position = "right")
+g1
+
+dataset <- clone(euk.mco)
+t1 <- trans_abund$new(dataset = dataset, taxrank = "Division", ntaxa = 10, groupmean = "Method")
+g2 <- t1$plot_bar(clustering_plot = TRUE, color_values = paletteer::paletteer_d("basetheme::deepblue"))
+g2[[1]] <- g2[[1]] + theme_bw() + theme(axis.title.x = element_text(size = 10), axis.ticks.y = element_blank(), axis.line.y = element_blank(), 
+                                        legend.title = element_text(size = 10), legend.text = element_text(size = 8), legend.position = "right")
+g2
+```
+
+### Alpha diversity
+
+```{r}
+library("tidyverse"); library("patchwork"); library("emmeans")
+metrics <- c("Observed", "Shannon", "Pielou")
+
+### 16S dataset
+alpha16 <- bac.mco$alpha_diversity %>% rownames_to_column("Sample") %>% left_join(bac.mco$sample_table %>% rownames_to_column("Sample"), by = "Sample") %>%
+           filter(Method != "Blank sample") %>% mutate(Time = factor(Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks")))
+
+### ANOVA + Tukey
+cat("\n==================== 16S ====================\n")
+
+for(i in metrics){ 
+cat("\n\n==========", i, "==========\n")
+fit <- lm(as.formula(paste0(i, " ~ Method * Time")), data = alpha16)
+print(anova(fit))
+cat("\nPost hoc: Method\n"); print(emmeans(fit,  pairwise ~ Method, adjust = "tukey")$contrasts)
+cat("\nPost hoc: Time\n"); print(emmeans(fit, pairwise ~ Time, adjust = "tukey")$contrasts) }
+
+alpha16.sum <- alpha16 %>% pivot_longer(cols = all_of(metrics), names_to = "Metric", values_to = "Value") %>% group_by(Method, Time, Metric) %>%
+               summarise(Mean = mean(Value), SD = sd(Value), SE = SD/sqrt(n()), .groups = "drop")
+alpha16.sum$Metric <- factor(alpha16.sum$Metric, levels = c("Observed", "Shannon", "Pielou"))
+ 
+### Plot
+p16 <- ggplot(alpha16.sum, aes(x = Time, y = Mean, colour = Method, group = Method)) + geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
+       geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.15, linewidth = 0.5) +
+       scale_colour_manual(values = col.method, name = "Treatment") + facet_wrap(~Metric, scales = "free_y", ncol = 3) + theme_bw() +
+       theme(legend.position = "right", legend.title = element_text(face = "bold"), strip.text = element_text(face = "bold"), 
+             axis.text.x = element_blank(), axis.text.y = element_text(size = 7),
+             axis.ticks.x = element_blank(), panel.grid.minor = element_blank()) + labs(x = NULL, y = "Mean ± SE")
+
+### 18S dataset
+alpha18 <- euk.mco$alpha_diversity %>% rownames_to_column("Sample") %>% left_join(euk.mco$sample_table %>% rownames_to_column("Sample"), by = "Sample") %>%
+           filter(Method != "Blank sample") %>% mutate(Time = factor( Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks")))
+
+### ANOVA + Tukey
+cat("\n==================== 18S ====================\n")
+
+for(i in metrics){
+cat("\n\n==========", i, "==========\n")
+fit <- lm(as.formula(paste0(i, " ~ Method * Time")), data = alpha18)
+print(anova(fit))
+cat("\nPost hoc: Method\n"); print(emmeans(fit, pairwise ~ Method, adjust = "tukey")$contrasts)
+cat("\nPost hoc: Time\n"); print(emmeans(fit, pairwise ~ Time, adjust = "tukey")$contrasts) }
+
+alpha18.sum <- alpha18 %>%   pivot_longer(cols = all_of(metrics), names_to = "Metric", values_to = "Value") %>% group_by(Method, Time, Metric) %>%
+               summarise(Mean = mean(Value), SD = sd(Value), SE = SD/sqrt(n()), .groups = "drop")
+alpha18.sum$Metric <- factor(alpha18.sum$Metric, levels = c("Observed", "Shannon", "Pielou"))
+
+### Plot
+p18 <- ggplot(alpha18.sum, aes(x = Time, y = Mean, colour = Method, group = Method)) + geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
+       geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.15, linewidth = 0.5) +
+       scale_colour_manual(values = col.method, name = "Treatment") + facet_wrap(~Metric, scales = "free_y", ncol = 3) + theme_bw() +
+       theme(legend.position = "right", legend.title = element_text(face = "bold"), strip.text = element_text(face = "bold"), 
+             axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(size = 7),
+             panel.grid.minor = element_blank()) + labs(x = "Storage duration", y = "Mean ± SE")
+
+### Combined figure
+a1 <- (p16 / p18) + plot_layout(guides = "collect") & theme(legend.position = "top"); a1
+```
+ 
+### Beta diversity
+
+```{r}
+library("vegan"); library("ggplot2"); library("patchwork")
+
+shape.method <- c("In dry ice then to −80°C" = 16, "No preservative at −80°C" = 15, "No preservative at −20°C" = 17, 
+                  "NAP buffer at RT" = 1, "Ethanol at RT" = 3, "No preservative at RT" = 4)
+
+### Remove blank sample [IF NOT REMOVED FROM PRE-PROCESSING!]
+keep16 <- rownames(bac.mco$sample_table) != "B124"; keep18 <- rownames(euk.mco$sample_table) != "B124"
+meta16 <- bac.mco$sample_table[keep16, ]; meta18 <- euk.mco$sample_table[keep18, ]
+
+meta16$Time <- factor(meta16$Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks"))
+meta18$Time <- factor(meta18$Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks"))
+
+### Bray-Curtis distance matrices
+bray16 <- as.dist(bac.mco$beta_diversity$bray[keep16, keep16])
+bray18 <- as.dist(euk.mco$beta_diversity$bray[keep18, keep18])
+
+### PERMANOVA
+cat("\n==================== 16S PERMANOVA ====================\n")
+adonis16 <- adonis2(bray16 ~ Method + Time + Method:Time, data = meta16, permutations = 999, by = "terms"); print(adonis16)
+
+cat("\n==================== 18S PERMANOVA ====================\n")
+adonis18 <- adonis2(bray18 ~ Method + Time + Method:Time, data = meta18, permutations = 999, by = "terms"); print(adonis18)
+
+### PERMDISP
+cat("\n==================== 16S PERMDISP ====================\n")
+disp16 <- betadisper(bray16, meta16$Method); print(anova(disp16)); print(permutest(disp16, permutations = 999))
+
+cat("\n==================== 18S PERMDISP ====================\n")
+disp18 <- betadisper(bray18, meta18$Method); print(anova(disp18)); print(permutest(disp18, permutations = 999))
+
+### PCoA - Prokaryotes
+ord16 <- cmdscale(bray16, eig = TRUE, k = 2); pcoa16 <- data.frame(Sample = rownames(meta16), Axis1 = ord16$points[, 1], Axis2 = ord16$points[, 2], meta16)
+var16 <- round(ord16$eig[1:2] / sum(ord16$eig[ord16$eig > 0]) * 100, 1)
+
+p16 <- ggplot(pcoa16, aes(Axis1, Axis2, colour = Time, shape = Method)) + geom_point(size = 3, stroke = 1, alpha = 0.6) + scale_colour_manual(values = col.time, name = "Storage duration") +
+       scale_shape_manual(values = shape.method, name = "Treatment") + theme_bw() +
+       theme(legend.position = "right", panel.grid.minor = element_blank()) +
+       labs(title = "Prokaryotes (16S)", x = paste0("PCoA1 (", var16[1], "%)"), y = paste0("PCoA2 (", var16[2], "%)"))
+
+### PCoA - Eukaryotes
+
+ord18 <- cmdscale(bray18, eig = TRUE, k = 2); pcoa18 <- data.frame(Sample = rownames(meta18), Axis1 = ord18$points[, 1], Axis2 = ord18$points[, 2], meta18)
+var18 <- round(ord18$eig[1:2] / sum(ord18$eig[ord18$eig > 0]) * 100, 1)
+
+p18 <- ggplot(pcoa18, aes(Axis1, Axis2, colour = Time, shape = Method)) + geom_point(size = 3, stroke = 1, alpha = 0.6) + scale_colour_manual(values = col.time, name = "Storage duration") +
+       scale_shape_manual(values = shape.method, name = "Treatment") + theme_bw() + 
+       theme(legend.position = "right", panel.grid.minor = element_blank()) +
+       labs(title = "Eukaryotes (18S)", x = paste0("PCoA1 (", var18[1], "%)"), y = paste0("PCoA2 (", var18[2], "%)"))
+
+### Combined figure
+b1 <- (p16 / p18) + plot_layout(guides = "collect") & theme(legend.position = "right"); b1
+```
+
+### Community stability
+
+```{r}
+### Community stability of 18 h samples per treatment
+
+library("vegan")
+meta16.18 <- subset(bac.mco$sample_table, Time == "18 h"); meta18.18 <- subset(euk.mco$sample_table, Time == "18 h")
+
+bray16.18 <- as.dist(bac.mco$beta_diversity$bray[rownames(meta16.18), rownames(meta16.18)])
+bray18.18 <- as.dist(euk.mco$beta_diversity$bray[rownames(meta18.18), rownames(meta18.18)])
+
+### PERMANOVA
+cat("\n==================== 16S (18 h only) ====================\n")
+adonis16.18 <- adonis2(bray16.18 ~ Method, data = meta16.18, permutations = 999); print(adonis16.18)
+cat("\n==================== 18S (18 h only) ====================\n")
+adonis18.18 <- adonis2(bray18.18 ~ Method, data = meta18.18, permutations = 999); print(adonis18.18)
+
+### PERMDISP
+cat("\n==================== 16S PERMDISP ====================\n")
+disp16.18 <- betadisper(bray16.18, meta16.18$Method); print(anova(disp16.18)); print(permutest(disp16.18, permutations = 999))
+cat("\n==================== 18S PERMDISP ====================\n")
+disp18.18 <- betadisper(bray18.18, meta18.18$Method); print(anova(disp18.18)); print(permutest(disp18.18, permutations = 999))
+```
+ 
+```{r}
+library("tidyverse"); library("vegan"); library("patchwork")
+
+calc_stability <- function(mco){
+otu <- as.matrix(mco$otu_table)
+# taxa x samples required
+meta <- mco$sample_table
+# sample IDs must match otu columns
+common.samples <- intersect(rownames(meta), colnames(otu)); meta <- meta[common.samples, ]; otu  <- otu[, common.samples]; res <- list()
+for(m in unique(meta$Method)){
+meta.sub <- meta %>% filter(Method == m)
+baseline.samples <- rownames( meta.sub %>% filter(Time == "18 h"))
+baseline.centroid <- rowMeans(otu[, baseline.samples, drop = FALSE])
+tmp <- lapply(rownames(meta.sub), function(s){ sample.vec <- otu[, s]
+bc <- vegdist(rbind(baseline.centroid, sample.vec),  method = "bray")[1]
+data.frame(Sample   = s, Method   = meta.sub[s, "Method"], Time     = meta.sub[s, "Time"], Distance = as.numeric(bc))})
+res[[m]] <- bind_rows(tmp)}
+bind_rows(res)}
+
+# Generate stability datasets
+stab16 <- calc_stability(bac.mco); stab18 <- calc_stability(euk.mco); head(stab16); head(stab18)
+
+stab16.sum <- stab16 %>% group_by(Method, Time) %>% summarise(Mean = mean(Distance), SD = sd(Distance), SE = SD / sqrt(n()), .groups = "drop") %>%
+              mutate(Time = factor(Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks")), TimeNum = c(1, 2, 3, 4, 5)[Time])
+
+stab18.sum <- stab18 %>% group_by(Method, Time) %>% summarise(Mean = mean(Distance), SD = sd(Distance), SE = SD / sqrt(n()), .groups = "drop") %>%
+              mutate(Time = factor(Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks")), TimeNum = c(1, 2, 3, 4, 5)[Time])
+
+### Prokaryotes
+p16 <- ggplot(stab16.sum, aes(x = TimeNum, y = Mean,  colour = Method, fill = Method, group = Method)) +
+       geom_ribbon(aes(ymin = Mean - SE, ymax = Mean + SE), alpha = 0.15, colour = NA) + geom_line(linewidth = 1, alpha = 0.8) +
+       geom_point(size = 3) +
+       scale_colour_manual(values = col.method, name = "Treatment") + scale_fill_manual(values = col.method, guide = "none") +
+       scale_x_continuous(breaks = 1:5, labels = levels(stab16.sum$Time)) + theme_bw() +
+       theme(legend.position = "none", panel.grid.minor = element_blank()) +
+       labs(title = "Prokaryotes (16S)", x = NULL, y = "Bray-Curtis distance to baseline")
+
+### Eukaryotes
+p18 <- ggplot(stab18.sum, aes(x = TimeNum, y = Mean, colour = Method, fill = Method, group = Method)) + 
+       geom_ribbon(aes(ymin = Mean - SE, ymax = Mean + SE), alpha = 0.15, colour = NA) +
+       geom_line( linewidth = 1, alpha = 0.8) + geom_point(size = 3) +
+       scale_colour_manual(values = col.method, name = "Treatment") + scale_fill_manual(values = col.method, guide = "none") +
+       scale_x_continuous(breaks = 1:5, labels = levels(stab18.sum$Time)) + theme_bw() +
+       theme(legend.position = "right", panel.grid.minor = element_blank()) +
+       labs(title = "Eukaryotes (18S)", x = "Storage duration", y = "Bray-Curtis distance to baseline")
+
+### Combined Figure
+s1 <- (p16 / p18) + plot_layout(guides = "collect") & theme(legend.position = "right"); s1
+
+library("tidyverse"); library("emmeans"); library("broom")
+
+stab16$Time <- factor(stab16$Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks"))
+stab18$Time <- factor(stab18$Time, levels = c("18 h", "2 wks", "4 wks", "6 wks", "8 wks"))
+
+### 16S stability ANOVA
+fit16 <- lm(Distance ~ Method * Time, data = stab16)
+
+cat("\n==================== 16S Stability ====================\n")
+anova16 <- anova(fit16); print(anova16); summary(fit16)
+
+### R²
+summary(fit16)$r.squared; summary(fit16)$adj.r.squared
+
+### Tukey: Treatments within each storage duration
+tukey16 <- emmeans(fit16, pairwise ~ Method | Time, adjust = "tukey"); print(tukey16$contrasts)
+
+### 18S stability ANOVA
+fit18 <- lm(Distance ~ Method * Time, data = stab18)
+
+cat("\n==================== 18S Stability ====================\n")
+anova18 <- anova(fit18); print(anova18); summary(fit18)
+
+### R²
+summary(fit18)$r.squared; summary(fit18)$adj.r.squared
+
+### Tukey: Treatments within each storage duration
+tukey18 <- emmeans(fit18, pairwise ~ Method | Time, adjust = "tukey"); print(tukey18$contrasts)
+
+### Quantify divergence rate through time
+time.map <- c("18 h" = 0, "2 wks" = 2, "4 wks" = 4, "6 wks" = 6, "8 wks" = 8)
+
+stab16$Week <- time.map[as.character(stab16$Time)]; stab18$Week <- time.map[as.character(stab18$Time)]
+slope16 <- lm(Distance ~ Method * Week, data = stab16);slope18 <- lm(Distance ~ Method * Week, data = stab18)
+
+cat("\n==================== 16S Divergence Rate ====================\n")
+print(anova(slope16))
+
+cat("\n==================== 18S Divergence Rate ====================\n")
+
+### 16S Stability Ranking
+stab16.rank <- stab16 %>% filter(Time == "8 wks") %>% group_by(Method) %>% 
+               summarise(Mean_BrayCurtis = mean(Distance), SD = sd(Distance), SE = SD / sqrt(n()), n = n(), .groups = "drop") %>%
+               arrange(Mean_BrayCurtis) %>% mutate(Rank = row_number()) %>%
+               select(Rank, Method, Mean_BrayCurtis, SE, SD, n)
+
+cat("\n==================== 16S Stability Ranking ====================\n")
+print(stab16.rank)
+
+### 18S stability ranking
+stab18.rank <- stab18 %>% filter(Time == "8 wks") %>% group_by(Method) %>% 
+               summarise(Mean_BrayCurtis = mean(Distance), SD = sd(Distance), SE = SD / sqrt(n()), n = n(), .groups = "drop") %>%
+               arrange(Mean_BrayCurtis) %>% mutate(Rank = row_number()) %>%
+               select(Rank, Method, Mean_BrayCurtis, SE, SD, n)
+
+cat("\n==================== 18S Stability Ranking ====================\n")
+print(stab18.rank)
+
+### Combined table
+stab.rank <- bind_rows(stab16.rank %>% mutate(Dataset = "Prokaryotes (16S)"), stab18.rank %>% mutate(Dataset = "Eukaryotes (18S)")) %>% relocate(Dataset); print(stab.rank)
+```
+
+```{r}
+library("tidyverse")
+
+rank.long <- rank.wide %>%  pivot_longer(cols = c(`Prokaryotes (16S)`, `Eukaryotes (18S)`), names_to = "Dataset", values_to = "Mean_BrayCurtis")
+
+ggplot() + geom_segment(data = rank.wide, aes(x = `Prokaryotes (16S)`, xend = `Eukaryotes (18S)`, y = Method, yend = Method), colour = "grey70", linewidth = 1) +
+geom_point(data = rank.long, aes(x = Mean_BrayCurtis, y = Method, colour = Dataset), size = 3) +
+scale_colour_manual(name = "Taxa", values = c("Prokaryotes (16S)" = "#1F78B4", "Eukaryotes (18S)" = "#E31A1C")) + theme_bw() +
+labs(x = "Mean Bray-Curtis distance after 8 weeks", y = NULL)
+```
+
+### Taxonomic shift analysis
+
+```{r}
+### Generate heatmap of top 10 taxa
+
+library("microeco"); library("tidyverse"); library("patchwork"); library("ggplot2")
+
+bac.mco$sample_table$Treatment_Time <- paste(bac.mco$sample_table$Method, bac.mco$sample_table$Time, sep = " | ")
+euk.mco$sample_table$Treatment_Time <- paste(euk.mco$sample_table$Method, euk.mco$sample_table$Time, sep = " | ")
+
+method.order <- c("In dry ice then to −80°C", "No preservative at −80°C", "No preservative at −20°C",
+                  "NAP buffer at RT", "Ethanol at RT", "No preservative at RT")
+time.order <- c("18 h", "2 wks", "4 wks", "6 wks", "8 wks")
+
+desired.order <- expand.grid(Method = method.order, Time = time.order) %>% mutate(Treatment_Time = paste(Method, Time, sep = " | ")) %>% pull(Treatment_Time)
+
+### Prokaryotes (Phylum)
+
+abund16 <- trans_abund$new(dataset = bac.mco, taxrank = "Phylum", ntaxa = 10)
+top10.phyla <- abund16$data_abund %>% group_by(Taxonomy) %>% summarise(MeanAbundance = mean(Abundance), .groups = "drop") %>% arrange(desc(MeanAbundance)) %>% slice_head(n = 10) %>% pull(Taxonomy)
+
+hm16 <- abund16$data_abund %>% filter(Taxonomy %in% top10.phyla) %>% group_by(Method, Time, Taxonomy) %>% summarise(Abundance = mean(Abundance), .groups = "drop") %>%
+        mutate(Treatment_Time = paste(Method, Time, sep = " | "))
+hm16$Treatment_Time <- factor(hm16$Treatment_Time, levels = desired.order)
+hm16 <- hm16 %>% group_by(Taxonomy) %>% mutate(Zscore = as.numeric(scale(Abundance))) %>% ungroup(); n_distinct(hm16$Taxonomy)
+
+s2a <- ggplot(hm16, aes(x = Treatment_Time, y = Taxonomy, fill = Zscore)) +
+       geom_tile() + scale_fill_gradient2(low = "#313695", mid = "#FFFFBF", high = "#A50026", midpoint = 0, name = "Z-score") + theme_bw() +
+       theme(axis.text.x = element_blank(), axis.text.y = element_text(size = 10), panel.grid = element_blank(),
+             plot.title = element_text(face = "bold", size = 10)) + labs(title = "Prokaryotes (16S)", x = NULL, y = "Phylum")
+
+### Eukaryotes (Division)
+
+abund18 <- trans_abund$new(dataset = euk.mco, taxrank = "Division", ntaxa = 10)
+top10.divisions <- abund18$data_abund %>% group_by(Taxonomy) %>% summarise(MeanAbundance = mean(Abundance), .groups = "drop") %>% arrange(desc(MeanAbundance)) %>% slice_head(n = 10) %>% pull(Taxonomy)
+
+hm18 <- abund18$data_abund %>% filter(Taxonomy %in% top10.divisions) %>% group_by(Method, Time, Taxonomy) %>% summarise(Abundance = mean(Abundance), .groups = "drop") %>%
+        mutate(Treatment_Time = paste(Method, Time, sep = " | "))
+hm18$Treatment_Time <- factor(hm18$Treatment_Time, levels = desired.order)
+hm18 <- hm18 %>% group_by(Taxonomy) %>% mutate(Zscore = as.numeric(scale(Abundance))) %>% ungroup(); n_distinct(hm18$Taxonomy)
+
+s2b <- ggplot(hm18, aes(x = Treatment_Time, y = Taxonomy, fill = Zscore)) +
+       geom_tile() + scale_fill_gradient2(low = "#313695", mid = "#FFFFBF", high = "#A50026", midpoint = 0, name = "Z-score") + theme_bw() +
+       theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 7), axis.text.y = element_text(size = 9), panel.grid = element_blank(),
+             plot.title = element_text(face = "bold", size = 10)) + labs(title = "Eukaryotes (18S)", x = NULL, y = "Division")
+
+### Combine Figure S2
+t1 <- s2a / s2b; t1
+```
+
+```{r}
+library("microeco"); library("tidyverse"); library("ggplot2"); library("patchwork")
+
+### Top prokaryotic phyla
+abund16 <- trans_abund$new(dataset = bac.mco, taxrank = "Phylum", ntaxa = 10); phy16 <- abund16$data_abund
+top16 <- phy16 %>% group_by(Taxonomy) %>% summarise(Var = var(Abundance), .groups = "drop") %>%  arrange(desc(Var)) %>% slice_head(n = 6) %>% pull(Taxonomy)
+phy16.plot <- phy16 %>% filter(Taxonomy %in% top16)
+
+### Plot
+p4a <- ggplot(phy16.plot, aes(Time, Abundance, colour = Method, group = Method)) +
+       stat_summary(fun = mean, geom = "line", linewidth = 0.8) + stat_summary(fun = mean, geom = "point", size = 2.5) +
+       facet_wrap(~Taxonomy, scales = "free_y", ncol = 3) + scale_colour_manual(values = col.method) + theme_bw() +
+       theme(legend.position = "none", strip.text = element_text(face = "bold")) +
+       labs(title = "Major prokaryotic phyla", x = NULL, y = "Relative abundance (%)")
+p4a
+
+### Top eukaryotic divisions
+abund18 <- trans_abund$new(dataset = euk.mco, taxrank = "Division", ntaxa = 10); div18 <- abund18$data_abund
+top18 <- div18 %>% group_by(Taxonomy) %>% summarise(Var = var(Abundance), .groups = "drop") %>% arrange(desc(Var)) %>% slice_head(n = 6) %>% pull(Taxonomy)
+div18.plot <- div18 %>% filter(Taxonomy %in% top18)
+
+### Plot
+p4b <- ggplot(div18.plot, aes(Time, Abundance, colour = Method, group = Method)) +
+       stat_summary(fun = mean, geom = "line", linewidth = 0.8) + stat_summary(fun = mean, geom = "point", size = 2.5) +
+       facet_wrap(~Taxonomy, scales = "free_y", ncol = 3) + scale_colour_manual( values = col.method) + theme_bw() +
+       theme(strip.text = element_text(face = "bold")) +
+       labs(title = "Major eukaryotic divisions", x = "Storage duration", y = "Relative abundance (%)")
+p4b
+
+p4 <- (p4a / p4b) +  plot_layout(heights = c(1, 1), guides = "collect") & theme(legend.position = "none", plot.title = element_text(size = 12)); p4
+```
+
+### Null model analysis
+
+```{r}
+library("microeco")
+
+### 16S
+null16 <- trans_nullmodel$new(dataset = bac.mco)
+null16$cal_ses_betampd(runs = 500); null16$cal_rcbray(runs = 500)
+null16$cal_process(use_betamntd = FALSE)
+
+### 18S
+null18 <- trans_nullmodel$new(dataset = euk.mco)
+null18$cal_ses_betampd(runs = 500); null18$cal_rcbray(runs = 500)
+null18$cal_process(use_betamntd = FALSE)
+
+names(null16); names(null18)
+head(null16$res_ses_betampd); head(null18$res_ses_betampd); head(null16$res_process); head(null18$res_process)
+
+saveRDS(null16$res_process, "src/null16_res_process.rds"); saveRDS(null16$res_ses_betampd, "src/null16_res_ses_betampd.rds")
+saveRDS(null16$res_rcbray, "src/null16_res_ses_betampd.rds")
+saveRDS(null18$res_process, "src/null18_res_process.rds"); saveRDS(null18$res_ses_betampd, "src/null18_res_ses_betampd.rds")
+saveRDS(null18$res_rcbray, "src/null18_res_ses_betampd.rds")
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+
+# ============================================================
+# Convert βNTI matrices to long format
+# ============================================================
+
+bnti16 <- as.data.frame(as.table(null16$res_ses_betampd)) %>%
+  rename(
+    Sample1 = Var1,
+    Sample2 = Var2,
+    betaNTI = Freq
+  ) %>%
+  filter(Sample1 != Sample2) %>%
+  left_join(
+    bac.mco$sample_table %>%
+      rownames_to_column("Sample1") %>%
+      select(Sample1, Method),
+    by = "Sample1"
+  ) %>%
+  rename(Treatment = Method)
+
+bnti18 <- as.data.frame(as.table(null18$res_ses_betampd)) %>%
+  rename(
+    Sample1 = Var1,
+    Sample2 = Var2,
+    betaNTI = Freq
+  ) %>%
+  filter(Sample1 != Sample2) %>%
+  left_join(
+    euk.mco$sample_table %>%
+      rownames_to_column("Sample1") %>%
+      select(Sample1, Method),
+    by = "Sample1"
+  ) %>%
+  rename(Treatment = Method)
+
+# ============================================================
+# A. βNTI distributions (16S)
+# ============================================================
+
+p4a <- ggplot(
+  bnti16,
+  aes(
+    x = Treatment,
+    y = betaNTI,
+    fill = Treatment,
+    colour = Treatment
+  )
+) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.20
+  ) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    alpha = 0.8
+  ) +
+  geom_hline(
+    yintercept = c(-2, 2),
+    linetype = 2
+  ) +
+  scale_fill_manual(values = col.method) +
+  scale_colour_manual(values = col.method) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    title = "Prokaryotes (16S)",
+    x = NULL,
+    y = expression(beta*NTI)
+  )
+
+# ============================================================
+# B. βNTI distributions (18S)
+# ============================================================
+
+p4b <- ggplot(
+  bnti18,
+  aes(
+    x = Treatment,
+    y = betaNTI,
+    fill = Treatment,
+    colour = Treatment
+  )
+) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.20
+  ) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    alpha = 0.8
+  ) +
+  geom_hline(
+    yintercept = c(-2, 2),
+    linetype = 2
+  ) +
+  scale_fill_manual(values = col.method) +
+  scale_colour_manual(values = col.method) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    title = "Eukaryotes (18S)",
+    x = NULL,
+    y = expression(beta*NTI)
+  )
+
+# ============================================================
+# C. Community assembly processes
+# ============================================================
+
+proc <- bind_rows(
+  null16$res_process %>%
+    mutate(Dataset = "16S"),
+  null18$res_process %>%
+    mutate(Dataset = "18S")
+)
+
+proc.cols <- c(
+  "variable selection"    = "#d95f02",
+  "homogeneous selection" = "#1b9e77",
+  "dispersal limitation"  = "#7570b3",
+  "homogeneous dispersal" = "#e7298a",
+  "drift"                 = "#66a61e"
+)
+
+p4c <- ggplot(
+  proc,
+  aes(
+    x = Dataset,
+    y = percentage,
+    fill = process
+  )
+) +
+  geom_col(
+    width = 0.75,
+    colour = "black",
+    linewidth = 0.2
+  ) +
+  scale_fill_manual(
+    values = proc.cols,
+    name = "Assembly process"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    #title = "Community assembly processes",
+    x = NULL,
+    y = "Contribution (%)"
+  )
+
+# ============================================================
+# Figure 4
+# ============================================================
+
+e1 <- (p4a + p4b) +
+  plot_layout(
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "right"
+  )
+
+e1
+```
+
+```{r, Assembly processes by treatment}
+library(microeco)
+library(tidyverse)
+
+# ============================================================
+# Function: assembly processes by treatment
+# ============================================================
+
+calc_process_by_treatment <- function(mco.obj,
+                                      treatment.col = "Method",
+                                      runs = 500){
+
+  treatments <- unique(mco.obj$sample_table[[treatment.col]])
+
+  res.list <- vector("list", length(treatments))
+  names(res.list) <- treatments
+
+  for(i in seq_along(treatments)){
+
+    trt <- treatments[i]
+
+    cat("Processing:", trt, "\n")
+
+    tmp <- clone(mco.obj)
+
+    keep.samples <- rownames(tmp$sample_table)[
+      tmp$sample_table[[treatment.col]] == trt
+    ]
+
+    tmp$sample_table <- tmp$sample_table[
+      keep.samples,
+      ,
+      drop = FALSE
+    ]
+
+    tmp$tidy_dataset()
+
+    nm <- trans_nullmodel$new(dataset = tmp)
+
+    nm$cal_ses_betampd(runs = runs)
+    nm$cal_rcbray(runs = runs)
+    nm$cal_process(use_betamntd = FALSE)
+
+    res.list[[i]] <- nm$res_process %>%
+      mutate(
+        Treatment = trt
+      )
+  }
+
+  bind_rows(res.list)
+}
+
+# ============================================================
+# 16S
+# ============================================================
+
+proc16.trt <- calc_process_by_treatment(
+  bac.mco,
+  treatment.col = "Method",
+  runs = 500
+)
+
+proc16.trt$Dataset <- "16S"
+
+# ============================================================
+# 18S
+# ============================================================
+
+proc18.trt <- calc_process_by_treatment(
+  euk.mco,
+  treatment.col = "Method",
+  runs = 500
+)
+
+proc18.trt$Dataset <- "18S"
+
+# ============================================================
+# Combined table
+# ============================================================
+
+proc.trt <- bind_rows(
+  proc16.trt,
+  proc18.trt
+)
+
+proc.trt
+
+# save results
+write.csv(
+  proc.trt,
+  "assembly_process_by_treatment.csv",
+  row.names = FALSE
+)
+
+# ============================================================
+# Plot
+# ============================================================
+
+proc.cols <- c(
+  "variable selection"    = "#d95f02",
+  "homogeneous selection" = "#1b9e77",
+  "dispersal limitation"  = "#7570b3",
+  "homogeneous dispersal" = "#e7298a",
+  "drift"                 = "#66a61e"
+)
+
+ggplot(
+  proc.trt,
+  aes(
+    x = Treatment,
+    y = percentage,
+    fill = process
+  )
+) + 
+  geom_col() +
+  facet_wrap(
+    ~ Dataset,
+    ncol = 2
+  ) +
+  scale_fill_manual(values = proc.cols) +
+  theme_bw() + coord_flip() +
+  theme(
+    axis.text.x = element_text(
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Contribution (%)",
+    fill = "Assembly process"
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Custom legend
+
+```{r}
+# Define the colors and text for the legend
+legend_colors <- c("#1B9E77","#E6AB02","#D95F02","#A6761D","#666666")
+legend_text <- c("Field Sample", "2 Weeks", "4 Weeks", "6 Weeks", "8 Weeks")
+
+# Create a data frame for legend entries
+legend_df <- data.frame(x = rep(1, length(legend_text)), y = seq(length(legend_text)), legend_text = legend_text, legend_colors = factor(legend_text, levels = legend_text))
+
+# Create a ggplot with custom legend
+custom_legend_plot <- ggplot(legend_df, aes(x = x, y = y, color = legend_colors)) + geom_point(size = 5) + scale_color_manual(values = legend_colors, guide = guide_legend(title = "Category")) + theme_bw() + theme(legend.position = "right")
+
+# Print the custom legend plot
+print(custom_legend_plot)
+```
